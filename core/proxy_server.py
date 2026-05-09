@@ -53,7 +53,7 @@ class ProxyServer:
                     p = self.rotator.get_proxy()
                     if not p:
                         break
-                    if p.protocol in ("http", "https"):
+                    if p.protocol in ("http", "https") and getattr(p, "anonymity", "transparent") != "transparent":
                         proxy = p
                         break
                 
