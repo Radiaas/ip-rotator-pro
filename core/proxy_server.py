@@ -4,7 +4,7 @@ Acts as a proxy gateway that rotates the upstream proxy for each request.
 """
 
 import asyncio
-from aiohttp import web, ClientSession, ClientTimeout
+import json
 from typing import Optional
 from core.models import ProxyPool
 from core.rotator import IPRotator
@@ -13,8 +13,8 @@ from utils.display import Display
 
 class ProxyServer:
     """
-    Local HTTP proxy server that forwards requests through rotating proxies.
-    Set your browser/app proxy to localhost:8080 and every request will use a different IP.
+    Local TCP proxy server that forwards raw requests to rotating upstream proxies.
+    Supports both HTTP and HTTPS (CONNECT) seamlessly by acting as a transparent TCP pipe.
     """
 
     def __init__(self, rotator: IPRotator, display: Optional[Display] = None,
@@ -23,103 +23,95 @@ class ProxyServer:
         self.display = display or Display()
         self.host = host
         self.port = port
-        self._app = None
-        self._runner = None
+        self.server = None
         self._request_count = 0
 
-    async def handle_request(self, request: web.Request) -> web.Response:
-        """Handle incoming proxy request and forward through a rotated proxy."""
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle incoming client connection."""
         self._request_count += 1
 
-        # Get next proxy from rotator
-        proxy = self.rotator.get_proxy()
-        if not proxy:
-            return web.Response(
-                status=503,
-                text="No alive proxies available. Pool is empty.",
-                content_type="text/plain",
-            )
-
-        # Build target URL
-        target_url = str(request.url)
-        if not target_url.startswith("http"):
-            target_url = f"http://{request.host}{request.path_qs}"
-
-        proxy_url = f"http://{proxy.ip}:{proxy.port}"
-
         try:
-            timeout = ClientTimeout(total=15)
-            async with ClientSession(timeout=timeout) as session:
-                # Forward headers (excluding hop-by-hop)
-                headers = dict(request.headers)
-                for hop_header in ["Connection", "Keep-Alive", "Proxy-Authenticate",
-                                   "Proxy-Authorization", "TE", "Trailers",
-                                   "Transfer-Encoding", "Upgrade", "Proxy-Connection"]:
-                    headers.pop(hop_header, None)
+            # Read the initial request chunk to check if it's a status request
+            request_data = await reader.read(8192)
+            if not request_data:
+                writer.close()
+                return
 
-                # Read request body
-                body = await request.read()
+            # Check for status endpoint
+            if request_data.startswith(b"GET /__status"):
+                await self._serve_status(writer)
+                return
 
-                async with session.request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    data=body if body else None,
-                    proxy=proxy_url,
-                    ssl=False,
-                    allow_redirects=False,
-                ) as resp:
-                    # Read response
-                    resp_body = await resp.read()
+            # Get an HTTP proxy (TCP relay only works natively with HTTP upstream proxies
+            # that understand CONNECT for HTTPS)
+            proxy = None
+            for _ in range(5):  # Try to find an HTTP proxy
+                p = self.rotator.get_proxy()
+                if not p:
+                    break
+                if p.protocol in ("http", "https"):
+                    proxy = p
+                    break
 
-                    # Report success
-                    self.rotator.report_success(proxy)
+            if not proxy:
+                # No suitable proxy found
+                response = b"HTTP/1.1 503 Service Unavailable\r\n\r\nNo HTTP proxies available."
+                writer.write(response)
+                await writer.drain()
+                writer.close()
+                return
 
-                    # Build response
-                    response_headers = dict(resp.headers)
-                    for hop_header in ["Content-Encoding", "Transfer-Encoding", "Connection"]:
-                        response_headers.pop(hop_header, None)
+            # Connect to upstream proxy
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy.ip, proxy.port),
+                    timeout=10.0
+                )
+            except Exception:
+                self.rotator.report_failure(proxy)
+                writer.close()
+                return
 
-                    return web.Response(
-                        status=resp.status,
-                        body=resp_body,
-                        headers=response_headers,
-                    )
+            # We successfully connected. Forward the initial data.
+            up_writer.write(request_data)
+            await up_writer.drain()
+            self.rotator.report_success(proxy)
 
-        except Exception as e:
-            self.rotator.report_failure(proxy)
-
-            # Try to get another proxy and retry once
-            retry_proxy = self.rotator.get_proxy()
-            if retry_proxy:
-                try:
-                    retry_proxy_url = f"http://{retry_proxy.ip}:{retry_proxy.port}"
-                    timeout = ClientTimeout(total=15)
-                    async with ClientSession(timeout=timeout) as session:
-                        async with session.request(
-                            method=request.method,
-                            url=target_url,
-                            proxy=retry_proxy_url,
-                            ssl=False,
-                            allow_redirects=False,
-                        ) as resp:
-                            resp_body = await resp.read()
-                            self.rotator.report_success(retry_proxy)
-                            return web.Response(
-                                status=resp.status,
-                                body=resp_body,
-                            )
-                except Exception:
-                    self.rotator.report_failure(retry_proxy)
-
-            return web.Response(
-                status=502,
-                text=f"Proxy request failed: {str(e)}",
-                content_type="text/plain",
+            # Start piping data in both directions
+            await asyncio.gather(
+                self._pipe(reader, up_writer),
+                self._pipe(up_reader, writer),
+                return_exceptions=True
             )
 
-    async def handle_status(self, request: web.Request) -> web.Response:
-        """API endpoint to check server and pool status."""
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Pipe data from reader to writer."""
+        try:
+            while True:
+                data = await reader.read(16384)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _serve_status(self, writer: asyncio.StreamWriter):
+        """Serve the JSON status payload."""
         pool = self.rotator.pool
         pool.update_stats()
 
@@ -135,33 +127,26 @@ class ProxyServer:
             },
         }
 
-        import json
-        return web.Response(
-            status=200,
-            text=json.dumps(status, indent=2, default=str),
-            content_type="application/json",
+        body = json.dumps(status, indent=2, default=str).encode('utf-8')
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Connection: close\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode('utf-8') + body
         )
+        writer.write(response)
+        await writer.drain()
+        writer.close()
 
     async def start(self):
-        """Start the local proxy server."""
-        self._app = web.Application()
-
-        # Status endpoint
-        self._app.router.add_get("/__status", self.handle_status)
-        self._app.router.add_get("/__status/", self.handle_status)
-
-        # Catch-all for proxy requests
-        self._app.router.add_route("*", "/{path:.*}", self.handle_request)
-
-        self._runner = web.AppRunner(self._app, access_log=None)
-        await self._runner.setup()
-
-        site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
+        """Start the local TCP proxy server."""
+        self.server = await asyncio.start_server(
+            self.handle_client, self.host, self.port
+        )
 
         self.display.console.print()
-        self.display.success(f"🌐 Proxy server started on {self.host}:{self.port}")
-        self.display.info(f"Set your browser/app proxy to: http://{self.host}:{self.port}")
+        self.display.success(f"[🌐] Proxy server started on {self.host}:{self.port}")
+        self.display.info(f"Set your Android Wi-Fi or Proxy App to: {self.host}:{self.port}")
         self.display.info(f"Status endpoint: http://{self.host}:{self.port}/__status")
         self.display.info(f"Rotation strategy: {self.rotator.strategy}")
         self.display.console.print()
@@ -169,6 +154,7 @@ class ProxyServer:
 
     async def stop(self):
         """Stop the proxy server."""
-        if self._runner:
-            await self._runner.cleanup()
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
             self.display.info("Proxy server stopped")
