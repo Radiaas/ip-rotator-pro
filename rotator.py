@@ -196,6 +196,12 @@ Examples:
     # === RUN (full pipeline) ===
     run_parser = subparsers.add_parser("run", help="Full pipeline: scrape -> validate -> auto-refresh")
     run_parser.add_argument(
+        "--source", "-src",
+        choices=["proxyscrape", "github_lists", "geonode", "web_scraper", "all"],
+        default="all",
+        help="Source to scrape from (default: all)",
+    )
+    run_parser.add_argument(
         "--interval", "-i", type=int, default=None,
         help="Auto-refresh interval in seconds (default: 180 = 3 min)",
     )
@@ -401,7 +407,11 @@ async def cmd_run(args, config, display):
     interval = args.interval or config["rotation"]["auto_refresh_interval"]
     timeout = args.timeout or config["validation"]["timeout"]
 
-    scraper = ProxyScraper(pool, display, enabled_sources=config["scraping"]["enabled_sources"])
+    sources = config["scraping"]["enabled_sources"]
+    if getattr(args, "source", "all") != "all":
+        sources = [args.source]
+
+    scraper = ProxyScraper(pool, display, enabled_sources=sources)
     validator = ProxyValidator(
         pool, display,
         timeout=timeout,
