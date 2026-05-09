@@ -42,40 +42,47 @@ class ProxyServer:
                 await self._serve_status(writer)
                 return
 
-            # Get an HTTP proxy (TCP relay only works natively with HTTP upstream proxies
-            # that understand CONNECT for HTTPS)
-            proxy = None
-            for _ in range(5):  # Try to find an HTTP proxy
-                p = self.rotator.get_proxy()
-                if not p:
+            # Try connecting to upstream proxies with retries
+            up_reader, up_writer = None, None
+            connected_proxy = None
+            
+            for attempt in range(3):
+                # Get an HTTP proxy
+                proxy = None
+                for _ in range(5):
+                    p = self.rotator.get_proxy()
+                    if not p:
+                        break
+                    if p.protocol in ("http", "https"):
+                        proxy = p
+                        break
+                
+                if not proxy:
                     break
-                if p.protocol in ("http", "https"):
-                    proxy = p
-                    break
+                    
+                try:
+                    up_reader, up_writer = await asyncio.wait_for(
+                        asyncio.open_connection(proxy.ip, proxy.port),
+                        timeout=8.0
+                    )
+                    connected_proxy = proxy
+                    break  # Success!
+                except Exception:
+                    self.rotator.report_failure(proxy)
+                    continue
 
-            if not proxy:
-                # No suitable proxy found
-                response = b"HTTP/1.1 503 Service Unavailable\r\n\r\nNo HTTP proxies available."
+            if not up_writer or not connected_proxy:
+                # No suitable proxy found or all attempts failed
+                response = b"HTTP/1.1 503 Service Unavailable\r\n\r\nProxy connection failed."
                 writer.write(response)
                 await writer.drain()
-                writer.close()
-                return
-
-            # Connect to upstream proxy
-            try:
-                up_reader, up_writer = await asyncio.wait_for(
-                    asyncio.open_connection(proxy.ip, proxy.port),
-                    timeout=10.0
-                )
-            except Exception:
-                self.rotator.report_failure(proxy)
                 writer.close()
                 return
 
             # We successfully connected. Forward the initial data.
             up_writer.write(request_data)
             await up_writer.drain()
-            self.rotator.report_success(proxy)
+            self.rotator.report_success(connected_proxy)
 
             # Start piping data in both directions
             await asyncio.gather(
@@ -128,12 +135,13 @@ class ProxyServer:
         }
 
         body = json.dumps(status, indent=2, default=str).encode('utf-8')
-        response = (
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Connection: close\r\n"
-            f"Content-Length: {len(body)}\r\n\r\n".encode('utf-8') + body
+        headers = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Connection: close\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
         )
+        response = headers.encode('utf-8') + body
         writer.write(response)
         await writer.drain()
         writer.close()
