@@ -1,0 +1,16 @@
+output/*.txt
+output/*.csv
+output/*.json
+!output/.gitkeep
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/
+*.log

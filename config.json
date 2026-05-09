@@ -1,0 +1,35 @@
+{
+  "validation": {
+    "timeout": 10,
+    "max_concurrent": 100,
+    "judge_urls": [
+      "http://httpbin.org/ip",
+      "http://api.ipify.org",
+      "http://icanhazip.com",
+      "http://ifconfig.me/ip",
+      "http://checkip.amazonaws.com"
+    ],
+    "retry_count": 2
+  },
+  "rotation": {
+    "strategy": "smart",
+    "max_fail_count": 3,
+    "auto_refresh_interval": 180
+  },
+  "scraping": {
+    "enabled_sources": [
+      "proxyscrape",
+      "github_lists",
+      "geonode",
+      "web_scraper"
+    ]
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "export": {
+    "output_dir": "output",
+    "default_format": "txt"
+  }
+}
