@@ -18,7 +18,7 @@ class ProxyServer:
     """
 
     def __init__(self, rotator: IPRotator, display: Optional[Display] = None,
-                 host: str = "127.0.0.1", port: int = 8080):
+                 host: str = "0.0.0.0", port: int = 8080):
         self.rotator = rotator
         self.display = display or Display()
         self.host = host
